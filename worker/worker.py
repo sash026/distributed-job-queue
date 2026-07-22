@@ -7,6 +7,7 @@ import traceback
 
 from core.redis_client import RedisClient
 from core.schemas import Job, JobStatus
+from worker.tasks import get_task_handler
 
 PROCESSING_QUEUE_KEY = "queue:processing"
 DEAD_LETTER_QUEUE_KEY = "queue:dead_letter"
@@ -22,15 +23,10 @@ WORKER_ID = socket.gethostname()
 
 
 async def execute_task(job: Job) -> dict:
-    if job.name == "add_numbers":
-        result = sum(job.payload["numbers"])
-        return {"sum": result}
-
-    if job.name == "fail_me":
-        raise ValueError("fail_me: intentional failure requested by job payload")
-
-    await asyncio.sleep(5)
-    return {"message": "processed"}
+    handler = get_task_handler(job.name)
+    if handler is None:
+        raise ValueError(f"No task handler registered for job name '{job.name}'")
+    return await handler(job.payload)
 
 
 async def heartbeat(job_id: str) -> None:
