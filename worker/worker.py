@@ -3,8 +3,10 @@ import asyncio
 import contextlib
 import signal
 import socket
+import time
 import traceback
 
+from core import metrics
 from core.redis_client import RedisClient
 from core.schemas import Job, JobStatus
 from worker.tasks import get_task_handler
@@ -60,6 +62,7 @@ async def worker_loop(queue_keys: list[str], shutdown_event: asyncio.Event) -> N
         job_json = None
         source_queue_key = None
         for queue_key in queue_keys:
+            consume_started_at = time.perf_counter()
             job_json = await redis_client.redis.blmove(
                 queue_key,
                 PROCESSING_QUEUE_KEY,
@@ -68,6 +71,14 @@ async def worker_loop(queue_keys: list[str], shutdown_event: asyncio.Event) -> N
                 dest="LEFT",
             )
             if job_json is not None:
+                # Elapsed time of the BLMOVE call that actually returned a job.
+                # If the queue was empty and this call blocked waiting for a
+                # producer, that wait is included - this is "how long did
+                # picking a job up take", not a pure Redis round-trip.
+                consume_latency = time.perf_counter() - consume_started_at
+                await metrics.record_sample(
+                    redis_client.redis, metrics.CONSUME_LATENCY_SAMPLES_KEY, consume_latency
+                )
                 source_queue_key = queue_key
                 break
 
@@ -77,6 +88,11 @@ async def worker_loop(queue_keys: list[str], shutdown_event: asyncio.Event) -> N
 
         job = Job.model_validate_json(job_json)
 
+        queue_wait_time = time.time() - job.created_at
+        await metrics.record_sample(
+            redis_client.redis, metrics.QUEUE_WAIT_SAMPLES_KEY, queue_wait_time
+        )
+
         job.status = JobStatus.RUNNING
         await redis_client.redis.set(f"job:{job.id}", job.model_dump_json(), ex=JOB_TTL_SECONDS)
         await heartbeat(job.id)
@@ -84,16 +100,22 @@ async def worker_loop(queue_keys: list[str], shutdown_event: asyncio.Event) -> N
         # Extends processing_ttl:{id} every 10s so long-running jobs aren't
         # mistaken for a dead worker by monitor.py while still executing.
         heartbeat_task = asyncio.create_task(_heartbeat_loop(job.id))
+        execution_started_at = time.perf_counter()
         try:
             result = await execute_task(job)
         except Exception:
             job.error = traceback.format_exc()
             job.retries += 1
             job.status = JobStatus.PENDING if job.retries < job.max_retries else JobStatus.FAILED
+            await metrics.increment_counter(redis_client.redis, metrics.RETRIES_TOTAL_KEY)
         else:
             job.status = JobStatus.COMPLETED
             job.result = result
         finally:
+            execution_time = time.perf_counter() - execution_started_at
+            await metrics.record_sample(
+                redis_client.redis, metrics.EXECUTION_TIME_SAMPLES_KEY, execution_time
+            )
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
@@ -107,6 +129,16 @@ async def worker_loop(queue_keys: list[str], shutdown_event: asyncio.Event) -> N
             await redis_client.redis.rpush(source_queue_key, updated_job_json)
         elif job.status == JobStatus.FAILED:
             await redis_client.redis.rpush(DEAD_LETTER_QUEUE_KEY, updated_job_json)
+            await metrics.increment_counter(redis_client.redis, metrics.JOBS_FAILED_TOTAL_KEY)
+
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            job_latency = time.time() - job.created_at
+            await metrics.record_sample(
+                redis_client.redis, metrics.JOB_LATENCY_SAMPLES_KEY, job_latency
+            )
+            await metrics.record_completion_event(redis_client.redis)
+            if job.status == JobStatus.COMPLETED:
+                await metrics.increment_counter(redis_client.redis, metrics.JOBS_COMPLETED_TOTAL_KEY)
 
         # Job reached a terminal state or was requeued for retry on its own, so
         # it's no longer at risk of being mistaken for a dead worker's abandoned job.
@@ -123,6 +155,7 @@ async def main(queue_keys: list[str]) -> None:
         loop.add_signal_handler(sig, shutdown_event.set)
 
     await redis_client.redis.sadd(WORKERS_ONLINE_KEY, WORKER_ID)
+    await metrics.ensure_system_start_time(redis_client.redis)
     registration_task = asyncio.create_task(_register_worker_loop())
 
     try:

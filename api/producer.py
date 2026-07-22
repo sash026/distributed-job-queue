@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from api.admin import router as admin_router
 from api.metrics import router as metrics_router
+from core import metrics
 from core.redis_client import RedisClient
 from core.schemas import Job, JobStatus
 
@@ -21,6 +22,7 @@ redis_client = RedisClient()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await metrics.ensure_system_start_time(redis_client.redis)
     yield
     await redis_client.close()
 
@@ -53,7 +55,11 @@ async def create_job(request: JobCreateRequest) -> JobCreateResponse:
     job_json = job.model_dump_json()
     queue_key = f"queue:{request.queue_name}"
 
+    publish_started_at = time.perf_counter()
     await redis_client.redis.rpush(queue_key, job_json)
+    publish_latency = time.perf_counter() - publish_started_at
+    await metrics.record_sample(redis_client.redis, metrics.PUBLISH_LATENCY_SAMPLES_KEY, publish_latency)
+
     await redis_client.redis.set(f"job:{job.id}", job_json, ex=JOB_TTL_SECONDS)
 
     return JobCreateResponse(job_id=job.id, status=job.status)
@@ -79,7 +85,7 @@ async def _stream_job_status(job_id: str) -> AsyncIterator[str]:
         await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
 
 
-@app.get("/api/v1/jobs/{job_id}")
+@app.get("/api/v1/jobs/{job_id}", response_model=None)
 async def get_job(job_id: str, stream: bool = False) -> Job | StreamingResponse:
     job_json = await redis_client.redis.get(f"job:{job_id}")
     if job_json is None:
